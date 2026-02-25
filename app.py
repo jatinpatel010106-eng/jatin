@@ -1,193 +1,348 @@
-import json
-import sqlite3
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from math import ceil
 
-BASE_DIR = Path(__file__).resolve().parent
-PUBLIC_DIR = BASE_DIR / "public"
-DB_PATH = BASE_DIR / "tasks.db"
+from bson.objectid import ObjectId
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
+from database.mongo_config import (
+    parking_history_collection,
+    users_collection,
+    vehicles_collection,
+)
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                notes TEXT,
-                reminder_at TEXT NOT NULL,
-                priority TEXT NOT NULL DEFAULT 'medium',
-                completed INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
+app = Flask(__name__)
+app.secret_key = "replace_this_with_a_secure_secret_key"
+
+# Hourly rates in INR by vehicle type
+PARKING_RATES = {
+    "Car": 50,
+    "Bike": 20,
+    "Truck": 80,
+}
 
 
-def dict_from_row(row):
-    return {
-        "id": row[0],
-        "title": row[1],
-        "notes": row[2],
-        "reminder_at": row[3],
-        "priority": row[4],
-        "completed": bool(row[5]),
-        "created_at": row[6],
+# ---------- Utility helpers ----------
+def calculate_fee(vehicle_type: str, entry_time: datetime, exit_time: datetime) -> tuple[int, float]:
+    """Calculate parked hours (rounded up) and fee."""
+    duration_seconds = max((exit_time - entry_time).total_seconds(), 0)
+    hours = max(1, ceil(duration_seconds / 3600))
+    rate = PARKING_RATES.get(vehicle_type, 30)
+    return hours, float(hours * rate)
+
+
+def current_user():
+    """Return the currently logged in user document, if any."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return users_collection.find_one({"_id": ObjectId(user_id)})
+
+
+def login_required():
+    """Simple guard for endpoints that require a logged in user."""
+    if "user_id" not in session:
+        return jsonify({"error": "Please login first."}), 401
+    return None
+
+
+# ---------- Page routes ----------
+@app.route("/")
+def home_page():
+    return render_template("index.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+
+    data = request.get_json(silent=True) or request.form
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required."}), 400
+
+    user = users_collection.find_one({"email": email})
+    if not user or not check_password_hash(user.get("password_hash", ""), password):
+        return jsonify({"error": "Invalid email or password."}), 401
+
+    session["user_id"] = str(user["_id"])
+    session["username"] = user["username"]
+    session["role"] = user.get("role", "user")
+
+    return jsonify(
+        {
+            "message": "Login successful.",
+            "role": user.get("role", "user"),
+            "redirect": url_for("dashboard"),
+        }
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        return render_template("register.html")
+
+    data = request.get_json(silent=True) or request.form
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+
+    if not username or not email or not password:
+        return jsonify({"error": "All fields are required."}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+
+    if users_collection.find_one({"email": email}):
+        return jsonify({"error": "Email already registered."}), 409
+
+    user_data = {
+        "username": username,
+        "email": email,
+        "password_hash": generate_password_hash(password),
+        "role": "user",
+        "created_at": datetime.utcnow(),
+    }
+    users_collection.insert_one(user_data)
+
+    return jsonify({"message": "Registration successful. Please login."}), 201
+
+
+@app.route("/dashboard")
+def dashboard():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    return render_template(
+        "dashboard.html",
+        username=session.get("username", "User"),
+        role=session.get("role", "user"),
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("home_page"))
+
+
+# ---------- Parking API routes ----------
+@app.route("/add_vehicle", methods=["POST"])
+def add_vehicle():
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True) or request.form
+    owner_name = (data.get("owner_name") or "").strip()
+    vehicle_number = (data.get("vehicle_number") or "").strip().upper()
+    vehicle_type = (data.get("vehicle_type") or "").strip().title()
+
+    if not owner_name or not vehicle_number or vehicle_type not in PARKING_RATES:
+        return jsonify({"error": "Provide valid owner name, number, and type."}), 400
+
+    if vehicles_collection.find_one({"vehicle_number": vehicle_number, "status": "parked"}):
+        return jsonify({"error": "Vehicle is already parked."}), 409
+
+    vehicle_doc = {
+        "vehicle_number": vehicle_number,
+        "owner_name": owner_name,
+        "vehicle_type": vehicle_type,
+        "entry_time": datetime.utcnow(),
+        "status": "parked",
+        "created_by": session.get("username"),
     }
 
+    result = vehicles_collection.insert_one(vehicle_doc)
 
-class TaskHandler(BaseHTTPRequestHandler):
-    def _send_json(self, payload, status=200):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    return jsonify(
+        {
+            "message": "Vehicle entry added.",
+            "vehicle_id": str(result.inserted_id),
+            "entry_time": vehicle_doc["entry_time"].isoformat(),
+        }
+    ), 201
 
-    def _serve_file(self, file_path):
-        if not file_path.exists() or not file_path.is_file():
-            self.send_error(404, "File not found")
-            return
 
-        content_type = "text/plain"
-        if file_path.suffix == ".html":
-            content_type = "text/html"
-        elif file_path.suffix == ".css":
-            content_type = "text/css"
-        elif file_path.suffix == ".js":
-            content_type = "application/javascript"
+@app.route("/exit_vehicle", methods=["POST"])
+def exit_vehicle():
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
 
-        body = file_path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    data = request.get_json(silent=True) or request.form
+    vehicle_number = (data.get("vehicle_number") or "").strip().upper()
 
-    def _parse_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
-            return {}
-        raw_body = self.rfile.read(length).decode("utf-8")
-        try:
-            return json.loads(raw_body)
-        except json.JSONDecodeError:
-            return parse_qs(raw_body)
+    if not vehicle_number:
+        return jsonify({"error": "Vehicle number is required."}), 400
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
+    vehicle = vehicles_collection.find_one({"vehicle_number": vehicle_number, "status": "parked"})
+    if not vehicle:
+        return jsonify({"error": "No parked vehicle found with this number."}), 404
 
-        if parsed.path == "/api/tasks":
-            with sqlite3.connect(DB_PATH) as conn:
-                rows = conn.execute(
-                    "SELECT id, title, notes, reminder_at, priority, completed, created_at FROM tasks ORDER BY reminder_at ASC"
-                ).fetchall()
-            self._send_json([dict_from_row(row) for row in rows])
-            return
+    entry_time = vehicle.get("entry_time", datetime.utcnow())
+    exit_time = datetime.utcnow()
+    duration_hours, fee = calculate_fee(vehicle.get("vehicle_type", "Car"), entry_time, exit_time)
 
-        if parsed.path == "/":
-            self._serve_file(PUBLIC_DIR / "index.html")
-            return
+    vehicles_collection.update_one(
+        {"_id": vehicle["_id"]},
+        {
+            "$set": {
+                "status": "exited",
+                "exit_time": exit_time,
+                "duration_hours": duration_hours,
+                "total_fee": fee,
+            }
+        },
+    )
 
-        target = (PUBLIC_DIR / parsed.path.lstrip("/")).resolve()
-        if PUBLIC_DIR in target.parents or target == PUBLIC_DIR:
-            self._serve_file(target)
-        else:
-            self.send_error(403, "Forbidden")
+    parking_history_collection.insert_one(
+        {
+            "vehicle_number": vehicle_number,
+            "owner_name": vehicle.get("owner_name"),
+            "vehicle_type": vehicle.get("vehicle_type"),
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "duration_hours": duration_hours,
+            "total_fee": fee,
+            "processed_by": session.get("username"),
+        }
+    )
 
-    def do_POST(self):
-        if self.path != "/api/tasks":
-            self.send_error(404)
-            return
+    return jsonify(
+        {
+            "message": "Vehicle exited successfully.",
+            "duration_hours": duration_hours,
+            "total_fee": fee,
+        }
+    )
 
-        payload = self._parse_body()
-        title = (payload.get("title") or "").strip()
-        reminder_at = (payload.get("reminder_at") or "").strip()
-        notes = (payload.get("notes") or "").strip()
-        priority = (payload.get("priority") or "medium").strip().lower()
 
-        if not title or not reminder_at:
-            self._send_json({"error": "title and reminder_at are required"}, 400)
-            return
+@app.route("/vehicles", methods=["GET"])
+def list_vehicles():
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
 
-        if priority not in {"low", "medium", "high"}:
-            priority = "medium"
+    query_number = (request.args.get("number") or "").strip().upper()
+    filter_query = {"status": "parked"}
 
-        created_at = datetime.utcnow().isoformat()
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.execute(
-                "INSERT INTO tasks (title, notes, reminder_at, priority, completed, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-                (title, notes, reminder_at, priority, created_at),
-            )
-            conn.commit()
-            task_id = cur.lastrowid
+    if query_number:
+        filter_query["vehicle_number"] = {"$regex": query_number, "$options": "i"}
 
-            row = conn.execute(
-                "SELECT id, title, notes, reminder_at, priority, completed, created_at FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-        self._send_json(dict_from_row(row), 201)
+    vehicles = list(vehicles_collection.find(filter_query).sort("entry_time", 1))
+    response = []
+    for vehicle in vehicles:
+        response.append(
+            {
+                "id": str(vehicle["_id"]),
+                "vehicle_number": vehicle.get("vehicle_number"),
+                "owner_name": vehicle.get("owner_name"),
+                "vehicle_type": vehicle.get("vehicle_type"),
+                "entry_time": vehicle.get("entry_time").isoformat() if vehicle.get("entry_time") else None,
+                "status": vehicle.get("status"),
+            }
+        )
 
-    def do_PUT(self):
-        parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/tasks/"):
-            self.send_error(404)
-            return
+    return jsonify(response)
 
-        task_id = parsed.path.removeprefix("/api/tasks/").strip()
-        if not task_id.isdigit():
-            self._send_json({"error": "invalid task id"}, 400)
-            return
 
-        payload = self._parse_body()
-        completed = payload.get("completed")
-        if not isinstance(completed, bool):
-            self._send_json({"error": "completed must be boolean"}, 400)
-            return
+@app.route("/vehicles/<vehicle_id>", methods=["DELETE"])
+def delete_vehicle(vehicle_id):
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
 
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("UPDATE tasks SET completed = ? WHERE id = ?", (1 if completed else 0, int(task_id)))
-            conn.commit()
-            row = conn.execute(
-                "SELECT id, title, notes, reminder_at, priority, completed, created_at FROM tasks WHERE id = ?",
-                (int(task_id),),
-            ).fetchone()
+    try:
+        result = vehicles_collection.delete_one({"_id": ObjectId(vehicle_id)})
+    except Exception:
+        return jsonify({"error": "Invalid vehicle ID."}), 400
 
-        if row is None:
-            self._send_json({"error": "task not found"}, 404)
-            return
+    if result.deleted_count == 0:
+        return jsonify({"error": "Vehicle record not found."}), 404
 
-        self._send_json(dict_from_row(row))
+    return jsonify({"message": "Vehicle record deleted."})
 
-    def do_DELETE(self):
-        parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/tasks/"):
-            self.send_error(404)
-            return
 
-        task_id = parsed.path.removeprefix("/api/tasks/").strip()
-        if not task_id.isdigit():
-            self._send_json({"error": "invalid task id"}, 400)
-            return
+# ---------- Admin API routes ----------
+@app.route("/admin/users", methods=["GET"])
+def admin_users():
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
 
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (int(task_id),))
-            conn.commit()
+    if session.get("role") != "admin":
+        return jsonify({"error": "Admin access only."}), 403
 
-        if cur.rowcount == 0:
-            self._send_json({"error": "task not found"}, 404)
-            return
+    users = list(users_collection.find({}, {"password_hash": 0}).sort("created_at", -1))
+    formatted_users = [
+        {
+            "id": str(user["_id"]),
+            "username": user.get("username"),
+            "email": user.get("email"),
+            "role": user.get("role", "user"),
+        }
+        for user in users
+    ]
 
-        self._send_json({"status": "deleted"})
+    return jsonify(formatted_users)
+
+
+@app.route("/admin/history", methods=["GET"])
+def admin_history():
+    auth_error = login_required()
+    if auth_error:
+        return auth_error
+
+    if session.get("role") != "admin":
+        return jsonify({"error": "Admin access only."}), 403
+
+    history = list(parking_history_collection.find({}).sort("exit_time", -1))
+    formatted_history = []
+    total_earnings = 0.0
+
+    for item in history:
+        total_earnings += float(item.get("total_fee", 0))
+        formatted_history.append(
+            {
+                "id": str(item["_id"]),
+                "vehicle_number": item.get("vehicle_number"),
+                "owner_name": item.get("owner_name"),
+                "vehicle_type": item.get("vehicle_type"),
+                "entry_time": item.get("entry_time").isoformat() if item.get("entry_time") else None,
+                "exit_time": item.get("exit_time").isoformat() if item.get("exit_time") else None,
+                "duration_hours": item.get("duration_hours"),
+                "total_fee": item.get("total_fee"),
+            }
+        )
+
+    return jsonify({"total_earnings": round(total_earnings, 2), "history": formatted_history})
+
+
+# ---------- Startup ----------
+def bootstrap_indexes():
+    """Create useful indexes and ensure an admin account exists."""
+    users_collection.create_index("email", unique=True)
+    vehicles_collection.create_index([("vehicle_number", 1), ("status", 1)])
+    parking_history_collection.create_index("vehicle_number")
+
+    admin_email = "admin@parking.com"
+    if not users_collection.find_one({"email": admin_email}):
+        users_collection.insert_one(
+            {
+                "username": "Admin",
+                "email": admin_email,
+                "password_hash": generate_password_hash("admin123"),
+                "role": "admin",
+                "created_at": datetime.utcnow(),
+            }
+        )
 
 
 if __name__ == "__main__":
-    init_db()
-    server = HTTPServer(("0.0.0.0", 8000), TaskHandler)
-    print("Server running at http://localhost:8000")
-    server.serve_forever()
+    bootstrap_indexes()
+    app.run(debug=True)
