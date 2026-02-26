@@ -185,3 +185,7 @@ http://127.0.0.1:5000
 - **Login/Register**: Centered card-based forms with validation messages.
 - **Dashboard**: Modern cards for vehicle entry, exit, search, parked vehicle table, and admin panel widgets for users/history.
 
+
+## Additional Project Direction
+
+For college presentation-oriented alternatives and a recommended simple-yet-unique idea, see `PROJECT_PROPOSAL.md`.
