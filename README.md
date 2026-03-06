@@ -189,3 +189,8 @@ http://127.0.0.1:5000
 ## Additional Project Direction
 
 For college presentation-oriented alternatives and a recommended simple-yet-unique idea, see `PROJECT_PROPOSAL.md`.
+
+---
+
+## Added: Java + MySQL Syllabus Project
+A complete desktop Core Java project is available in `java-core-syllabus-project/` with Swing GUI, JDBC MySQL, NIO, serialization, multithreading, and networking demos.
